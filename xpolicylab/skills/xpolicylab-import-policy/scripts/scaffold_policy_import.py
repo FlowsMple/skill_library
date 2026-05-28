@@ -126,62 +126,178 @@ TODO:
     # minimal import shim and add TODO-heavy adapter content if the template did
     # not create those files for some reason.
     (target / "__init__.py").write_text('"""XPolicyLab policy package."""\n', encoding="utf-8")
-    eval_path = target / "eval.sh"
-    eval_path.write_text(
-        f'''#!/bin/bash
+
+    # create_policy.sh copies demo_policy/eval.sh, setup_eval_policy_server.sh,
+    # and setup_eval_env_client.sh verbatim. Those templates derive policy_name
+    # from `basename "${SCRIPT_DIR}"`, so they already work for <PolicyName>
+    # without per-policy substitution. Only fall back to writing them here if
+    # the copy did not happen for some reason.
+    write_if_missing(
+        target / "eval.sh",
+        '''#!/bin/bash
 set -e
 
-policy_name={args.name}
-dataset_name=${{1}}
-task_name=${{2}}
-env_cfg_type=${{3}}
-expert_data_num=${{4}}
-action_type=${{5}}
-gpu_id=${{6}}
-seed=${{7}}
-policy_conda_env=${{8}}
-eval_env_conda_env=${{9}}
-policy_gpu_id="${{gpu_id}}"
-env_gpu_id="${{gpu_id}}"
-eval_batch=false
-additional_info=""
+dataset_name=$1
+task_name=$2
+ckpt_name=$3
+env_cfg_type=$4
+expert_data_num=$5
+action_type=$6
+seed=$7
+policy_gpu_id=$8
+env_gpu_id=$9
+policy_conda_env=${10}
+eval_env_conda_env=${11}
 
-ROOT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")/../../.." && pwd)"
-UTILS_DIR="${{ROOT_DIR}}/XPolicyLab/utils"
-yaml_file="${{ROOT_DIR}}/XPolicyLab/policy/${{policy_name}}/deploy.yml"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+UTILS_DIR="${ROOT_DIR}/XPolicyLab/utils"
 
-action_dim=$(bash "${{UTILS_DIR}}/get_action_dim.sh" "${{ROOT_DIR}}" "${{env_cfg_type}}")
-echo -e "\\033[33m[INFO] Action dim: ${{action_dim}}\\033[0m"
-FREE_PORT=$(bash "${{UTILS_DIR}}/get_free_port.sh")
+SERVER_SCRIPT="${SCRIPT_DIR}/setup_eval_policy_server.sh"
+CLIENT_SCRIPT="${SCRIPT_DIR}/setup_eval_env_client.sh"
 
-cleanup(){{ [[ -n "${{SERVER_PID:-}}" ]] && echo -e "\\033[31m[CLEANUP] Killing server PID=${{SERVER_PID}}\\033[0m" && kill "${{SERVER_PID}}" 2>/dev/null || true; }}
+policy_server_port=$(bash "${UTILS_DIR}/get_free_port.sh")
+policy_server_ip="localhost"
+
+additional_info="ckpt_name=${ckpt_name},action_type=${action_type}"
+
+cleanup() {
+    if [[ -n "${SERVER_PID:-}" ]]; then
+        echo "[MAIN] kill server ${SERVER_PID}"
+        kill "${SERVER_PID}" 2>/dev/null || true
+    fi
+}
 trap cleanup EXIT
 
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate "${{policy_conda_env}}"
+echo "[MAIN] start server, policy_server_port=${policy_server_port}"
 
-PYTHONWARNINGS=ignore::UserWarning \\
-CUDA_VISIBLE_DEVICES="${{policy_gpu_id}}" python "${{ROOT_DIR}}/XPolicyLab/setup_policy_server.py" \\
-    --config_path "${{yaml_file}}" \\
-    --overrides \\
-        port="${{FREE_PORT}}" \\
-        dataset_name="${{dataset_name}}" \\
-        task_name="${{task_name}}" \\
-        env_cfg_type="${{env_cfg_type}}" \\
-        expert_data_num="${{expert_data_num}}" \\
-        seed="${{seed}}" \\
-        policy_name="${{policy_name}}" \\
-        action_type="${{action_type}}" \\
-        action_dim="${{action_dim}}" \\
-    &
+bash "${SERVER_SCRIPT}" \\
+    "${dataset_name}" \\
+    "${task_name}" \\
+    "${ckpt_name}" \\
+    "${env_cfg_type}" \\
+    "${expert_data_num}" \\
+    "${action_type}" \\
+    "${seed}" \\
+    "${policy_gpu_id}" \\
+    "${policy_conda_env}" \\
+    "${policy_server_port}" &
+
 SERVER_PID=$!
 
-CUDA_VISIBLE_DEVICES="${{env_gpu_id}}" bash "${{UTILS_DIR}}/run_debug_env_client.sh" \\
-    "${{eval_batch}}" "${{eval_env_conda_env}}" "${{FREE_PORT}}" \\
-    "${{dataset_name}}" "${{task_name}}" "${{env_cfg_type}}" "${{policy_name}}" \\
-    "${{additional_info}}" "${{ROOT_DIR}}" "${{seed}}" "${{env_gpu_id}}"
+sleep 3
+
+echo "[MAIN] start client, server=${policy_server_ip}:${policy_server_port}"
+
+bash "${CLIENT_SCRIPT}" \\
+    "${dataset_name}" \\
+    "${task_name}" \\
+    "${ckpt_name}" \\
+    "${env_cfg_type}" \\
+    "${action_type}" \\
+    "${seed}" \\
+    "${env_gpu_id}" \\
+    "${eval_env_conda_env}" \\
+    "${additional_info}" \\
+    "${policy_server_port}" \\
+    "${policy_server_ip}"
+
+echo "[MAIN] eval finished"
 ''',
-        encoding="utf-8",
+    )
+
+    write_if_missing(
+        target / "setup_eval_policy_server.sh",
+        '''#!/bin/bash
+set -e
+
+dataset_name=$1
+task_name=$2
+ckpt_name=$3
+env_cfg_type=$4
+expert_data_num=$5
+action_type=$6
+seed=$7
+policy_gpu_id=$8
+policy_conda_env=$9
+policy_server_port=${10}
+policy_server_host=${11:-"localhost"}
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+UTILS_DIR="${ROOT_DIR}/XPolicyLab/utils"
+
+policy_name="$(basename "${SCRIPT_DIR}")"
+yaml_file="${ROOT_DIR}/XPolicyLab/policy/${policy_name}/deploy.yml"
+
+action_dim=$(bash "${UTILS_DIR}/get_action_dim.sh" "${ROOT_DIR}" "${env_cfg_type}")
+
+echo "[SERVER] policy=${policy_name}, task=${task_name}, ckpt=${ckpt_name}, policy_server_port=${policy_server_port}, action_dim=${action_dim}"
+
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate "${policy_conda_env}"
+
+# TODO: append policy-specific overrides here (checkpoint_path, model_path, etc.).
+exec env \\
+    PYTHONWARNINGS=ignore::UserWarning \\
+    CUDA_VISIBLE_DEVICES="${policy_gpu_id}" \\
+    python "${ROOT_DIR}/XPolicyLab/setup_policy_server.py" \\
+        --config_path "${yaml_file}" \\
+        --overrides \\
+            policy_server_port="${policy_server_port}" \\
+            policy_server_host="${policy_server_host}" \\
+            dataset_name="${dataset_name}" \\
+            task_name="${task_name}" \\
+            ckpt_name="${ckpt_name}" \\
+            env_cfg_type="${env_cfg_type}" \\
+            seed="${seed}" \\
+            policy_name="${policy_name}" \\
+            action_type="${action_type}" \\
+            action_dim="${action_dim}"
+''',
+    )
+
+    write_if_missing(
+        target / "setup_eval_env_client.sh",
+        '''#!/bin/bash
+set -e
+
+dataset_name=$1
+task_name=$2
+ckpt_name=$3
+env_cfg_type=$4
+action_type=$5
+seed=$6
+env_gpu_id=$7
+eval_env_conda_env=$8
+additional_info=$9
+policy_server_port=${10}
+policy_server_ip=${11:-"localhost"}
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+UTILS_DIR="${ROOT_DIR}/XPolicyLab/utils"
+
+policy_name="$(basename "${SCRIPT_DIR}")"
+yaml_file="${ROOT_DIR}/XPolicyLab/policy/${policy_name}/deploy.yml"
+
+echo "[CLIENT] policy=${policy_name}, task=${task_name}, server=${policy_server_ip}:${policy_server_port}"
+
+bash "${UTILS_DIR}/setup_env_client.sh" \\
+    "${UTILS_DIR}" \\
+    "${yaml_file}" \\
+    "${eval_env_conda_env}" \\
+    "${policy_server_port}" \\
+    "${dataset_name}" \\
+    "${task_name}" \\
+    "${env_cfg_type}" \\
+    "${policy_name}" \\
+    "${additional_info}" \\
+    "${ROOT_DIR}" \\
+    "${seed}" \\
+    "${env_gpu_id}" \\
+    "${policy_server_ip}"
+''',
     )
 
     write_if_missing(
@@ -273,11 +389,13 @@ def eval_one_episode_batch(TASK_ENV, model_client):
         f'''policy_name: {args.name}
 dataset_name: null
 task_name: null
+ckpt_name: null
 env_cfg_type: null
 expert_data_num: null
 action_type: null
-gpu_id: null
 seed: null
+eval_batch: false        # flip to true only after update_obs_batch / get_action_batch are validated
+eval_env: debug          # debug | sim | real -- selects the env client runner via setup_env_client.sh
 checkpoint_path: null
 model_path: null
 upstream_dir: {source_dir}

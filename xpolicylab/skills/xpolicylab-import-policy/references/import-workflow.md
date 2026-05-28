@@ -120,23 +120,29 @@ Implement `model.py` with `class Model(ModelTemplate)`.
 ## 6. Scripts And Configs
 
 - `deploy.yml` must keep `policy_name` equal to the folder/import name.
-- Use `null` for values overridden by `eval.sh`.
+- Use `null` for values overridden by `setup_eval_policy_server.sh`.
+- `deploy.yml` must declare `eval_env` (`debug` / `sim` / `real`) and `eval_batch` (`true` / `false`). Switching client mode is done by editing these two fields, not by editing any `.sh` file.
 - `process_data.sh` may stay simple and assume the caller has already activated the policy environment. During deployment, the agent must run data-processing tests in the policy environment, not the XPolicyLab base environment or `eval_env_conda_env`.
 - `train.sh` should fail loudly when required language embeddings are missing or placeholders. A smoke-test override must be explicitly named, for example `ALLOW_PLACEHOLDER_T5=true`.
-- `eval.sh` should run the model server in the policy environment and the debug/eval client in `eval_env_conda_env`.
-- For uv-based policies, follow `policy/Pi_05`: pass `policy_uv_env_path`, activate `${policy_uv_env_path}/.venv/bin/activate` for the model server, and keep the debug client in `eval_env_conda_env`.
+- Eval is split into three coordinated scripts (mirror `policy/demo_policy`):
+  - `eval.sh` — orchestrator. Accepts `dataset_name task_name ckpt_name env_cfg_type expert_data_num action_type seed policy_gpu_id env_gpu_id policy_conda_env eval_env_conda_env`, allocates a `policy_server_port`, backgrounds the server script, runs the client script, and traps EXIT for cleanup. Build `additional_info="ckpt_name=${ckpt_name},action_type=${action_type}"`.
+  - `setup_eval_policy_server.sh` — activates the policy environment and `exec`s `XPolicyLab/setup_policy_server.py` with `policy_server_port`, `policy_server_host`, and policy-specific overrides (`checkpoint_path`, `model_path`, etc.). Use `CUDA_VISIBLE_DEVICES="${policy_gpu_id}"` only inside this script.
+  - `setup_eval_env_client.sh` — activates `eval_env_conda_env` and delegates to `XPolicyLab/utils/setup_env_client.sh`, which dispatches to `run_debug_env_client.sh`, `run_sim_env_client.sh`, or `run_real_policy_client.sh` based on `deploy.yml`'s `eval_env`. Accepts an optional trailing `policy_server_ip` for cross-machine deployment.
+- Keep `task_name` and `ckpt_name` strictly separate: `task_name` is the simulator task forwarded to the env client; `ckpt_name` resolves the checkpoint directory/file in the server script. They may differ (`ckpt_name=cotrain` evaluated on multiple `task_name`s).
+- For uv-based policies, follow `policy/Pi_05`: pass `policy_uv_env_path`, activate `${policy_uv_env_path}/.venv/bin/activate` inside `setup_eval_policy_server.sh`, and keep the debug client in `eval_env_conda_env`.
 - For Conda-based policies, pass `policy_conda_env` and `eval_env_conda_env` separately.
 
-Current debug-client wrapper signature:
+Current debug-client wrapper signature (called transitively by `setup_eval_env_client.sh` → `setup_env_client.sh` when `eval_env: debug`):
 
 ```bash
 bash XPolicyLab/utils/run_debug_env_client.sh \
-  <eval_batch> <eval_env_conda_env> <FREE_PORT> \
+  <eval_batch> <eval_env_conda_env> <policy_server_port> \
   <dataset_name> <task_name> <env_cfg_type> <policy_name> \
-  <additional_info> <ROOT_DIR> <seed> <env_gpu_id>
+  <additional_info> <ROOT_DIR> <seed> <env_gpu_id> \
+  [<policy_server_ip>]
 ```
 
-Use `false` first for single-environment `eval_one_episode`. Use `true` only after validating batch methods.
+Use `eval_batch: false` first for single-environment `eval_one_episode`. Switch to `true` only after validating batch methods. `policy_server_ip` defaults to `localhost`; pass it only for cross-machine deployment.
 
 ## 7. Reproducibility Notes
 
@@ -161,7 +167,8 @@ Run every validation tier that is locally feasible:
    - run the conversion on sample data such as `data/RoboDojo/test_data/arx_x5`;
    - verify converted image/state/action shapes.
 3. Model import, server startup, and single-environment debug-client tests when the policy environment, checkpoints, and runtime dependencies are available:
-   - run `eval.sh` through the current `run_debug_env_client.sh false ...` path;
+   - set `deploy.yml` to `eval_env: debug`, `eval_batch: false`;
+   - run `eval.sh` end to end — it backgrounds `setup_eval_policy_server.sh` and runs `setup_eval_env_client.sh`, which transitively reaches `run_debug_env_client.sh`;
    - confirm model server/client communication, deploy loop, observation encoding, action dictionary shape, and reset flow.
 4. Batch debug tests when batch support is implemented and single-environment debug has passed.
 5. Real training only when the user explicitly asks and the required compute, data, dependencies, and artifacts are available.
@@ -174,8 +181,14 @@ Do not deliver a half-finished scaffold as a completed integration. If dependenc
 
 | Symptom | Likely cause |
 |---------|--------------|
-| Connection refused on port | Server not up yet, wrong `FREE_PORT`, or crash during model init |
+| Connection refused on port | Server not up yet, wrong `policy_server_port`, `policy_server_ip` mismatch across machines, or crash during model init |
 | Import error for `Model` | `policy_name` mismatch or missing `model.py` |
 | Client unknown `eval_env` | Typo in `deploy.yml`; must be `debug`, `sim`, or `real` |
-| CUDA OOM on server | Wrong `CUDA_VISIBLE_DEVICES` or policy/eval GPUs swapped |
+| Looks for checkpoint under `task_name` | `setup_eval_policy_server.sh` overrides resolve the checkpoint via `task_name` instead of `ckpt_name` — fix to use `ckpt_name` |
+| CUDA OOM on server | Wrong `CUDA_VISIBLE_DEVICES` or policy/eval GPUs swapped — set per-script inside `setup_eval_policy_server.sh` / `setup_eval_env_client.sh`, never globally export in `eval.sh` |
 | Action key errors | `deploy.py` / `Model.get_action` output does not match env expectations; see policy contract reference |
+| Arm flies / over-extends past joint limits | Adapter inverts action normalization with the wrong stats family (e.g. `min/max` on a `q99`-mode checkpoint, or vice versa). `dataset_statistics.json` stores all of `min/max/mean/std/q01/q99` regardless of training mode, so picking the wrong pair silently rescales actions by `(used_high-used_low)/(true_high-true_low)`. Mirror the dataloader's `normalization_modes` for the active robot type. See "Action Normalization Mode" in `references/xpolicylab-policy-contract.md`. |
+| Gripper appears stuck / never grasps | Adapter honors the saved `mask` field in `dataset_statistics.json` for gripper dims. That mask is often generated from key names (`"gripper" -> False`), not from the trainer's per-element pass-through check (`q01 != q99`). Continuous grippers with `q01=0, q99=1` are normalized normally at training but pass through unchanged at deployment, leaving them in `[-1, 1]` instead of `[0, 1]`. Use `inv_mask = high != low` instead of the saved mask. |
+| Padded model output joints get garbage commands | Model emits actions at the per-key-padded width (gr00t-style: `arm->7, gripper_close->1, ...` summed = e.g. 16 for arx_x5) but `dataset_statistics.json` stats are at the raw width (e.g. 14). Adapter must strip per-key pad columns *before* unnormalization and `unpack_robot_state(...)`, otherwise stats and actions misalign silently. See "Action Normalization Mode" → padded vs raw dims. |
+| Arm twitches in place but does not execute the task | Deployment image preprocessing diverges from the dataloader's spatial transform — usually skipping a letterbox/`expand2square` step so a `(240, 320)` frame is stretched to `(224, 224)` while training mean-pads then resizes. The diffusion / flow-matching head sees OOD vision conditioning and collapses to ≈mean output, which after unnormalization is approximately the current joint state. Reproduce the upstream loader's full transform exactly inside `_standardize_rgb_image` (same letterbox color, same final size, same interpolation). See "Image Spatial Alignment" in `references/xpolicylab-policy-contract.md`. |
+| Arm twitches in place on hard tasks but moves on simple ones; or `state_dict` load fails on `obs_merger.weight` shape mismatch | Deployment `encode_obs` sends a single current frame to a model whose `obs_horizon > 1`. Released checkpoint's obs-merging linear was trained with multi-frame input (e.g. LDA-1B pretrain: `obs_merger.weight.shape = (1536, 1152)` ⇒ `obs_horizon=2` since `1152/384 - 1 = 2`), so the deploy frame count must equal `obs_horizon * num_views`. Common variant: training yaml says `obs_horizon=1` and `pretrained_checkpoint: null`, masking the misconfiguration by silently falling back to from-scratch — the run trains for 100k+ steps but never converges on harder tasks. Sync all three layers: training config (`obs_horizon` matches the pretrain ckpt), dataloader (`observation_indices` length matches `obs_horizon`, e.g. `[-5, 0]` for 2 frames), and adapter (`encode_obs` keeps a per-env per-view rolling buffer, pulls frames at `observation_indices` offsets clamped to `0` at episode start, clears on `reset()`, and flattens view-major / time-minor). See "Observation Window / History Frames" in `references/xpolicylab-policy-contract.md`. |
